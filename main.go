@@ -1,0 +1,279 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/TheManticoreProject/smbserver/core/server"
+	"github.com/TheManticoreProject/smbserver/core/utils"
+
+	"github.com/TheManticoreProject/Manticore/logger"
+	smb1 "github.com/TheManticoreProject/Manticore/network/smb/smb_v10/server"
+	"github.com/TheManticoreProject/goopts/parser"
+)
+
+// version is the release shown in the banner. It is overridden at build time
+// with -ldflags "-X main.version=<tag>" (see .github/workflows/release.yaml).
+var version = "dev"
+
+// banner returns the smbserver ASCII art banner, with the version
+// right-justified in a 10-character field. The backticks of the art cannot
+// appear inside a raw string, so they are injected explicitly.
+func banner() string {
+	art := `               _
+ ___ _ __ ___ | |__  ___  ___ _ ____   _____ _ __
+/ __| '_ ` + "`" + ` _ \| '_ \/ __|/ _ \ '__\ \ / / _ \ '__|
+\__ \ | | | | | |_) \__ \  __/ |   \ V /  __/ |
+|___/_| |_| |_|_.__/|___/\___|_|    \_/ \___|_|
+                                      %10s`
+	return fmt.Sprintf(art, "v"+version)
+}
+
+var (
+	// Configuration
+	debug bool
+
+	// Share
+	shareName   string
+	sharePath   string
+	extraShares []string
+	readOnly    bool
+
+	// Network
+	listenAddress string
+	port          int
+	useNBT        bool
+	nbtPort       int
+	serverName    string
+	dnsName       string
+	dnsDomain     string
+	nativeOS      string
+
+	// Authentication
+	authDomain   string
+	authUsername string
+	authPassword string
+	authHashes   string
+
+	// Protocols
+	noSMB1 bool
+	noSMB2 bool
+	browse bool
+
+	// Security
+	requireSigning    bool
+	requireEncryption bool
+
+	// Capture
+	challenge  string
+	osVersion  string
+	disableESS bool
+
+	// Output
+	outputFile string
+	logAccess  bool
+)
+
+func parseArgs() {
+	ap := parser.ArgumentsParser{
+		Banner: banner(),
+	}
+	ap.SetOptShowBannerOnHelp(true)
+	ap.SetOptShowBannerOnRun(true)
+
+	// Configuration flags
+	ap.NewBoolArgument(&debug, "", "--debug", false, "Debug mode.")
+
+	// Share positionals
+	ap.NewStringPositionalArgument(&shareName, "shareName", "Name of the share.")
+	ap.NewStringPositionalArgument(&sharePath, "sharePath", "Local directory to serve.")
+	ap.NewListOfStringsArgument(&extraShares, "-s", "--share", nil, false, "Additional share as NAME=PATH; repeatable.")
+
+	// Network flags
+	group_network, err := ap.NewArgumentGroup("Network")
+	if err != nil {
+		logger.Warnf("Error creating ArgumentGroup: %s", err)
+	} else {
+		group_network.NewStringArgument(&listenAddress, "-ip", "--interface-address", "0.0.0.0", false, "Address to listen on.")
+		group_network.NewTcpPortArgument(&port, "-P", "--port", 445, false, "Direct-TCP port; 0 disables direct TCP.")
+		group_network.NewBoolArgument(&useNBT, "", "--nbt", false, "Also listen for NetBIOS over TCP (Windows falls back to it).")
+		group_network.NewTcpPortArgument(&nbtPort, "", "--nbt-port", 139, false, "NetBIOS port used with --nbt.")
+		group_network.NewStringArgument(&serverName, "", "--server-name", "FILESRV", false, "NetBIOS name advertised to clients.")
+		group_network.NewStringArgument(&dnsName, "", "--dns-name", "", false, "FQDN advertised in the NTLM challenge (default: the NetBIOS name).")
+		group_network.NewStringArgument(&dnsDomain, "", "--dns-domain", "", false, "DNS domain advertised in the NTLM challenge (default: the domain).")
+		group_network.NewStringArgument(&nativeOS, "", "--native-os", "", false, "SMB1 \"native OS\" string (default: a Windows Server 2012 R2 value).")
+	}
+
+	// Authentication flags
+	group_auth, err := ap.NewArgumentGroup("Authentication")
+	if err != nil {
+		logger.Warnf("Error creating ArgumentGroup: %s", err)
+	} else {
+		group_auth.NewStringArgument(&authDomain, "-d", "--domain", "WORKGROUP", false, "Domain of the served account.")
+		group_auth.NewStringArgument(&authUsername, "-u", "--user", "", false, "Served account. Supports DOMAIN\\user. Without it every logon is a guest.")
+		group_auth.NewStringArgument(&authPassword, "-p", "--password", "", false, "Password of the served account.")
+		group_auth.NewStringArgument(&authHashes, "", "--hashes", "", false, "NT/LM hashes of the served account, format is [LMhash:]NThash.")
+	}
+
+	// Protocol flags
+	group_protocols, err := ap.NewArgumentGroup("Protocols")
+	if err != nil {
+		logger.Warnf("Error creating ArgumentGroup: %s", err)
+	} else {
+		group_protocols.NewBoolArgument(&noSMB1, "", "--no-smb1", false, "Do not serve SMB1 clients.")
+		group_protocols.NewBoolArgument(&noSMB2, "", "--no-smb2", false, "Do not serve SMB 2/3 clients.")
+		group_protocols.NewBoolArgument(&browse, "", "--browse", false, "Serve IPC$ so clients can list the share (net view, smbclient -L; SMB1 only).")
+	}
+
+	// Security flags
+	group_security, err := ap.NewArgumentGroup("Security")
+	if err != nil {
+		logger.Warnf("Error creating ArgumentGroup: %s", err)
+	} else {
+		group_security.NewBoolArgument(&readOnly, "", "--read-only", false, "Refuse every modification.")
+		group_security.NewBoolArgument(&requireSigning, "", "--require-signing", false, "Refuse unsigned sessions.")
+		group_security.NewBoolArgument(&requireEncryption, "", "--require-encryption", false, "Encrypt every session (SMB 3.x only, implies --no-smb1).")
+	}
+
+	// Capture flags
+	group_capture, err := ap.NewArgumentGroup("Capture")
+	if err != nil {
+		logger.Warnf("Error creating ArgumentGroup: %s", err)
+	} else {
+		group_capture.NewStringArgument(&challenge, "", "--challenge", "", false, "Fix the 8-byte NTLM server challenge (16 hex), to crack responses against a precomputed table.")
+		group_capture.NewStringArgument(&osVersion, "", "--os-version", "", false, "Advertise this Windows version (major.minor.build) in the NTLM challenge, to look like a real host.")
+		group_capture.NewBoolArgument(&disableESS, "", "--disable-ess", false, "Strip extended session security, so an NTLMv1 client yields a crack.sh-crackable response (use with --challenge).")
+	}
+
+	// Output flags
+	group_output, err := ap.NewArgumentGroup("Output")
+	if err != nil {
+		logger.Warnf("Error creating ArgumentGroup: %s", err)
+	} else {
+		group_output.NewStringArgument(&outputFile, "-o", "--output-file", "", false, "Append captured hashes to this file, in hashcat format.")
+		group_output.NewBoolArgument(&logAccess, "", "--log-access", false, "Log every file a client opens (who, path, read or write).")
+	}
+
+	ap.Parse()
+}
+
+func main() {
+	parseArgs()
+
+	logger.SetLevel(logger.LevelInfo)
+	if debug {
+		logger.SetLevel(logger.LevelDebug)
+	}
+
+	// Direct TCP is on unless -P 0; NetBIOS is added by --nbt. Both can run at once.
+	nbt := 0
+	if useNBT {
+		nbt = nbtPort
+	}
+
+	// The positional share is the primary one; --share adds more as NAME=PATH.
+	shares := []server.ShareSpec{{Name: shareName, Path: sharePath}}
+	for _, raw := range extraShares {
+		name, path, ok := strings.Cut(raw, "=")
+		if !ok || name == "" || path == "" {
+			logger.Errorf("Invalid --share %q, expected NAME=PATH", raw)
+			os.Exit(1)
+		}
+		shares = append(shares, server.ShareSpec{Name: name, Path: path})
+	}
+
+	options := server.Options{
+		Shares:            shares,
+		ReadOnly:          readOnly,
+		ListenAddress:     listenAddress,
+		TCPPort:           port,
+		NBTPort:           nbt,
+		ServerName:        serverName,
+		Domain:            authDomain,
+		DNSComputerName:   dnsName,
+		DNSDomainName:     dnsDomain,
+		NativeOS:          nativeOS,
+		RequireSigning:    requireSigning,
+		RequireEncryption: requireEncryption,
+		EnableSMB1:        !noSMB1 && !requireEncryption,
+		EnableSMB2:        !noSMB2,
+		OutputFile:        outputFile,
+		Browsable:         browse,
+		LogFileAccess:     logAccess,
+		DisableESS:        disableESS,
+	}
+
+	if challenge != "" {
+		parsed, err := utils.ParseChallenge(challenge)
+		if err != nil {
+			logger.Error(err.Error())
+			os.Exit(1)
+		}
+		options.Challenge = parsed
+	}
+	if osVersion != "" {
+		parsed, err := utils.ParseOSVersion(osVersion)
+		if err != nil {
+			logger.Error(err.Error())
+			os.Exit(1)
+		}
+		options.AdvertiseVersion = parsed
+	}
+
+	// Accept DOMAIN\user and DOMAIN/user; the embedded domain overrides -d.
+	if authUsername != "" {
+		if authPassword == "" && authHashes == "" {
+			logger.Warn("No password or hashes for the account: it will accept an empty password.")
+		}
+		if authPassword != "" && authHashes != "" {
+			logger.Warn("Both --password and --hashes given; using --hashes.")
+		}
+		domain, username := utils.SplitDomainUsername(authDomain, authUsername)
+		ntHash, err := utils.AccountHash(authPassword, authHashes)
+		if err != nil {
+			logger.Errorf("Invalid credentials: %s", err)
+			os.Exit(1)
+		}
+		options.Account = &smb1.Account{Domain: domain, Username: username, NTHash: ntHash}
+	}
+
+	srv, err := server.NewServer(options)
+	if err != nil {
+		logger.Error(err.Error())
+		os.Exit(1)
+	}
+
+	// Ctrl-C (or SIGTERM) stops the server cleanly and prints a recap.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		logger.Info("Shutting down.")
+		srv.Close()
+	}()
+
+	serveErr := srv.ListenAndServe()
+	summarize(srv.Captured())
+	if serveErr != nil {
+		logger.Error(serveErr.Error())
+		os.Exit(1)
+	}
+}
+
+// summarize lists the accounts captured during the run, once each.
+func summarize(creds []smb1.Credential) {
+	if len(creds) == 0 {
+		return
+	}
+	logger.Infof("Captured %d account(s):", len(creds))
+	for _, c := range creds {
+		kind := "NetNTLMv1"
+		if c.IsNTLMv2() {
+			kind = "NetNTLMv2"
+		}
+		logger.Infof("  %s (%s) from %s", c.Account(), kind, c.RemoteAddr)
+	}
+}

@@ -1,0 +1,5 @@
+/smbserver
+*.txt
+
+# ruflo local database
+/ruvector.db
